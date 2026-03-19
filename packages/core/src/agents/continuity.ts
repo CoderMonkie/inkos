@@ -361,42 +361,102 @@ ${chapterContent}`;
   }
 
   private parseAuditResult(content: string): AuditResult {
-    const jsonMatch = content.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) {
+    // Try multiple JSON extraction strategies (handles small/local models)
+
+    // Strategy 1: Find balanced JSON object (not greedy)
+    const balanced = this.extractBalancedJson(content);
+    if (balanced) {
+      const result = this.tryParseAuditJson(balanced);
+      if (result) return result;
+    }
+
+    // Strategy 2: Try the whole content as JSON (some models output pure JSON)
+    const trimmed = content.trim();
+    if (trimmed.startsWith("{")) {
+      const result = this.tryParseAuditJson(trimmed);
+      if (result) return result;
+    }
+
+    // Strategy 3: Look for ```json code blocks
+    const codeBlockMatch = content.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/);
+    if (codeBlockMatch) {
+      const result = this.tryParseAuditJson(codeBlockMatch[1]!.trim());
+      if (result) return result;
+    }
+
+    // Strategy 4: Try to extract individual fields via regex (last resort fallback)
+    const passedMatch = content.match(/"passed"\s*:\s*(true|false)/);
+    const issuesMatch = content.match(/"issues"\s*:\s*\[([\s\S]*?)\]/);
+    const summaryMatch = content.match(/"summary"\s*:\s*"([^"]*)"/);
+    if (passedMatch) {
+      const issues: AuditIssue[] = [];
+      if (issuesMatch) {
+        // Try to parse individual issue objects
+        const issuePattern = /\{[^{}]*"severity"\s*:\s*"[^"]*"[^{}]*\}/g;
+        let match: RegExpExecArray | null;
+        while ((match = issuePattern.exec(issuesMatch[1]!)) !== null) {
+          try {
+            const issue = JSON.parse(match[0]);
+            issues.push({
+              severity: issue.severity ?? "warning",
+              category: issue.category ?? "未分类",
+              description: issue.description ?? "",
+              suggestion: issue.suggestion ?? "",
+            });
+          } catch {
+            // skip malformed individual issue
+          }
+        }
+      }
       return {
-        passed: false,
-        issues: [
-          {
-            severity: "critical",
-            category: "系统错误",
-            description: "审稿输出格式异常，无法解析",
-            suggestion: "重新运行审稿",
-          },
-        ],
-        summary: "审稿输出解析失败",
+        passed: passedMatch[1] === "true",
+        issues,
+        summary: summaryMatch?.[1] ?? "",
       };
     }
 
+    return {
+      passed: false,
+      issues: [{
+        severity: "critical",
+        category: "系统错误",
+        description: "审稿输出格式异常，无法解析为 JSON",
+        suggestion: "可能是模型不支持结构化输出。尝试换一个更大的模型，或检查 API 返回格式。",
+      }],
+      summary: "审稿输出解析失败",
+    };
+  }
+
+  private extractBalancedJson(text: string): string | null {
+    const start = text.indexOf("{");
+    if (start === -1) return null;
+    let depth = 0;
+    for (let i = start; i < text.length; i++) {
+      if (text[i] === "{") depth++;
+      if (text[i] === "}") depth--;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+    return null;
+  }
+
+  private tryParseAuditJson(json: string): AuditResult | null {
     try {
-      const parsed = JSON.parse(jsonMatch[0]);
+      const parsed = JSON.parse(json);
+      if (typeof parsed.passed !== "boolean" && parsed.passed !== undefined) return null;
       return {
-        passed: Boolean(parsed.passed),
-        issues: Array.isArray(parsed.issues) ? parsed.issues : [],
+        passed: Boolean(parsed.passed ?? false),
+        issues: Array.isArray(parsed.issues)
+          ? parsed.issues.map((i: Record<string, unknown>) => ({
+              severity: (i.severity as string) ?? "warning",
+              category: (i.category as string) ?? "未分类",
+              description: (i.description as string) ?? "",
+              suggestion: (i.suggestion as string) ?? "",
+            }))
+          : [],
         summary: String(parsed.summary ?? ""),
       };
     } catch {
-      return {
-        passed: false,
-        issues: [
-          {
-            severity: "critical",
-            category: "系统错误",
-            description: "审稿 JSON 解析失败",
-            suggestion: "重新运行审稿",
-          },
-        ],
-        summary: "审稿 JSON 解析失败",
-      };
+      return null;
     }
   }
 

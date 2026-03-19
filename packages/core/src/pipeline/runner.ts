@@ -411,9 +411,13 @@ export class PipelineRunner {
       if (!existingFile) {
         throw new Error(`Chapter ${targetChapter} file not found in ${chaptersDir} (expected filename starting with ${paddedNum})`);
       }
+      const reviseLang = book.language ?? gp.language;
+      const reviseHeading = reviseLang === "en"
+        ? `# Chapter ${targetChapter}: ${chapterMeta.title}`
+        : `# 第${targetChapter}章 ${chapterMeta.title}`;
       await writeFile(
         join(chaptersDir, existingFile),
-        `# 第${targetChapter}章 ${chapterMeta.title}\n\n${reviseOutput.revisedContent}`,
+        `${reviseHeading}\n\n${reviseOutput.revisedContent}`,
         "utf-8",
       );
 
@@ -671,7 +675,7 @@ export class PipelineRunner {
 
     // Save original state files if not revised
     if (!revised) {
-      await writer.saveChapter(bookDir, output, gp.numericalSystem);
+      await writer.saveChapter(bookDir, output, gp.numericalSystem, pipelineLang);
     }
 
     // Save new truth files (summaries, subplots, emotional arcs, character matrix)
@@ -694,7 +698,39 @@ export class PipelineRunner {
     };
     await this.state.saveChapterIndex(bookId, [...existingIndex, newEntry]);
 
-    // 5.5 Snapshot state for rollback support
+    // 5.5 Audit drift correction — feed audit findings back into state
+    // This prevents the writer from repeating mistakes in the next chapter
+    const driftIssues = auditResult.issues.filter(
+      (i) => i.severity === "critical" || i.severity === "warning",
+    );
+    if (driftIssues.length > 0) {
+      const storyDir = join(bookDir, "story");
+      try {
+        const statePath = join(storyDir, "current_state.md");
+        const currentState = await readFile(statePath, "utf-8").catch(() => "");
+
+        // Append drift correction section (or replace existing one)
+        const correctionHeader = "## 审计纠偏（自动生成，下一章写作前参照）";
+        const correctionBlock = [
+          correctionHeader,
+          `> 第${chapterNumber}章审计发现以下问题，下一章写作时必须避免：`,
+          ...driftIssues.map((i) => `> - [${i.severity}] ${i.category}: ${i.description}`),
+          "",
+        ].join("\n");
+
+        // Replace existing correction block or append
+        const existingCorrectionIdx = currentState.indexOf(correctionHeader);
+        const updatedState = existingCorrectionIdx >= 0
+          ? currentState.slice(0, existingCorrectionIdx) + correctionBlock
+          : currentState + "\n\n" + correctionBlock;
+
+        await writeFile(statePath, updatedState, "utf-8");
+      } catch {
+        // Non-critical — don't block pipeline if drift correction fails
+      }
+    }
+
+    // 5.6 Snapshot state for rollback support
     await this.state.snapshotState(bookId, chapterNumber);
 
     // 6. Send notification
